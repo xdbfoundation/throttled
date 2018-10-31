@@ -2,13 +2,10 @@ package throttled
 
 import (
 	"fmt"
+	"sync"
 	"time"
-)
 
-const (
-	// Maximum number of times to retry SetIfNotExists/CompareAndSwap operations
-	// before returning an error.
-	maxCASAttempts = 10
+	"github.com/hashicorp/golang-lru"
 )
 
 // A RateLimiter manages limiting the rate of actions by key.
@@ -130,7 +127,9 @@ type GCRARateLimiter struct {
 	// think of it as how frequently the bucket leaks one unit.
 	emissionInterval time.Duration
 
-	store GCRAStore
+	keys *lru.Cache
+
+	sync.Mutex
 }
 
 // NewGCRARateLimiter creates a GCRARateLimiter. quota.Count defines
@@ -139,7 +138,7 @@ type GCRARateLimiter struct {
 // rate. For example, PerMin(60) permits 60 requests instantly per key
 // followed by one request per second indefinitely whereas PerSec(1)
 // only permits one request per second with no tolerance for bursts.
-func NewGCRARateLimiter(st GCRAStore, quota RateQuota) (*GCRARateLimiter, error) {
+func NewGCRARateLimiter(maxKeys int, quota RateQuota) (*GCRARateLimiter, error) {
 	if quota.MaxBurst < 0 {
 		return nil, fmt.Errorf("Invalid RateQuota %#v. MaxBurst must be greater than zero.", quota)
 	}
@@ -147,11 +146,16 @@ func NewGCRARateLimiter(st GCRAStore, quota RateQuota) (*GCRARateLimiter, error)
 		return nil, fmt.Errorf("Invalid RateQuota %#v. MaxRate must be greater than zero.", quota)
 	}
 
+	keys, err := lru.New(maxKeys)
+	if err != nil {
+		return nil, err
+	}
+
 	return &GCRARateLimiter{
 		delayVariationTolerance: quota.MaxRate.period * (time.Duration(quota.MaxBurst) + 1),
 		emissionInterval:        quota.MaxRate.period,
 		limit:                   quota.MaxBurst + 1,
-		store:                   st,
+		keys:                    keys,
 	}, nil
 }
 
@@ -171,66 +175,58 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 	rlc := RateLimitResult{Limit: g.limit, RetryAfter: -1}
 	limited := false
 
-	i := 0
-	for {
-		var err error
-		var tatVal int64
-		var updated bool
+	var tatVal int64
 
-		// tat refers to the theoretical arrival time that would be expected
-		// from equally spaced requests at exactly the rate limit.
-		tatVal, now, err = g.store.GetWithTime(key)
-		if err != nil {
-			return false, rlc, err
+	g.Lock()
+
+	// tat refers to the theoretical arrival time that would be expected
+	// from equally spaced requests at exactly the rate limit.
+
+	// START g.store.GetWithTime
+	now = time.Now()
+	storeVal, ok := g.keys.Get(key)
+	if !ok {
+		tatVal = -1
+	} else {
+		tatVal = *storeVal.(*int64)
+	}
+	// END g.store.GetWithTime
+
+	if tatVal == -1 {
+		tat = now
+	} else {
+		tat = time.Unix(0, tatVal)
+	}
+
+	increment := time.Duration(quantity) * g.emissionInterval
+	if now.After(tat) {
+		newTat = now.Add(increment)
+	} else {
+		newTat = tat.Add(increment)
+	}
+
+	// Block the request if the next permitted time is in the future
+	allowAt := newTat.Add(-(g.delayVariationTolerance))
+	if diff := now.Sub(allowAt); diff < 0 {
+		if increment <= g.delayVariationTolerance {
+			rlc.RetryAfter = -diff
 		}
+		ttl = tat.Sub(now)
+		limited = true
+	}
 
-		if tatVal == -1 {
-			tat = now
-		} else {
-			tat = time.Unix(0, tatVal)
-		}
-
-		increment := time.Duration(quantity) * g.emissionInterval
-		if now.After(tat) {
-			newTat = now.Add(increment)
-		} else {
-			newTat = tat.Add(increment)
-		}
-
-		// Block the request if the next permitted time is in the future
-		allowAt := newTat.Add(-(g.delayVariationTolerance))
-		if diff := now.Sub(allowAt); diff < 0 {
-			if increment <= g.delayVariationTolerance {
-				rlc.RetryAfter = -diff
-			}
-			ttl = tat.Sub(now)
-			limited = true
-			break
-		}
-
+	if !limited {
 		ttl = newTat.Sub(now)
 
+		newVal := newTat.UnixNano()
 		if tatVal == -1 {
-			updated, err = g.store.SetIfNotExistsWithTTL(key, newTat.UnixNano(), ttl)
+			g.keys.Add(key, &newVal)
 		} else {
-			updated, err = g.store.CompareAndSwapWithTTL(key, tatVal, newTat.UnixNano(), ttl)
-		}
-
-		if err != nil {
-			return false, rlc, err
-		}
-		if updated {
-			break
-		}
-
-		i++
-		if i > maxCASAttempts {
-			return false, rlc, fmt.Errorf(
-				"Failed to store updated rate limit data for key %s after %d attempts",
-				key, i,
-			)
+			*storeVal.(*int64) = newVal
 		}
 	}
+
+	g.Unlock()
 
 	next := g.delayVariationTolerance - ttl
 	if next > -g.emissionInterval {

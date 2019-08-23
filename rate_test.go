@@ -5,35 +5,12 @@ import (
 	"time"
 
 	"github.com/throttled/throttled"
-	"github.com/throttled/throttled/store/memstore"
 )
 
-const deniedStatus = 429
+type clockFixed time.Time
 
-type testStore struct {
-	store throttled.GCRAStore
-
-	clock       time.Time
-	failUpdates bool
-}
-
-func (ts *testStore) GetWithTime(key string) (int64, time.Time, error) {
-	v, _, e := ts.store.GetWithTime(key)
-	return v, ts.clock, e
-}
-
-func (ts *testStore) SetIfNotExistsWithTTL(key string, value int64, ttl time.Duration) (bool, error) {
-	if ts.failUpdates {
-		return false, nil
-	}
-	return ts.store.SetIfNotExistsWithTTL(key, value, ttl)
-}
-
-func (ts *testStore) CompareAndSwapWithTTL(key string, old, new int64, ttl time.Duration) (bool, error) {
-	if ts.failUpdates {
-		return false, nil
-	}
-	return ts.store.CompareAndSwapWithTTL(key, old, new, ttl)
+func (cf clockFixed) Now() time.Time {
+	return time.Time(cf)
 }
 
 func TestRateLimit(t *testing.T) {
@@ -68,20 +45,14 @@ func TestRateLimit(t *testing.T) {
 		14: {start.Add(9500 * time.Millisecond), 5, 2, 3 * time.Second, 3 * time.Second, true},
 	}
 
-	mst, err := memstore.New(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := testStore{store: mst}
-
-	rl, err := throttled.NewGCRARateLimiter(&st, rq)
+	rl, err := throttled.NewGCRARateLimiter(100, rq)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Start the server
 	for i, c := range cases {
-		st.clock = c.now
+		rl.Clock = clockFixed(c.now)
 
 		limited, context, err := rl.RateLimit("foo", c.volume)
 		if err != nil {
@@ -107,22 +78,5 @@ func TestRateLimit(t *testing.T) {
 		if have, want := context.RetryAfter, c.retry; have != want {
 			t.Errorf("%d: expected RetryAfter to be %d but got %d", i, want, have)
 		}
-	}
-}
-
-func TestRateLimitUpdateFailures(t *testing.T) {
-	rq := throttled.RateQuota{MaxRate: throttled.PerSec(1), MaxBurst: 1}
-	mst, err := memstore.New(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := testStore{store: mst, failUpdates: true}
-	rl, err := throttled.NewGCRARateLimiter(&st, rq)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, _, err := rl.RateLimit("foo", 1); err == nil {
-		t.Error("Expected limiting to fail when store updates fail")
 	}
 }

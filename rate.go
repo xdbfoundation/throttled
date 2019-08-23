@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru"
 )
 
 // A RateLimiter manages limiting the rate of actions by key.
@@ -110,11 +110,28 @@ func PerHour(n int) Rate { return Rate{time.Hour / time.Duration(n), n} }
 // PerDay represents a number of requests per day.
 func PerDay(n int) Rate { return Rate{24 * time.Hour / time.Duration(n), n} }
 
+// Clock provides the current time right now.
+type Clock interface {
+	Now() time.Time
+}
+
+// ClockFunc is a wrapper for functions that provide the current time right
+// now.
+type ClockFunc func() time.Time
+
+// Now provides the current time right now as defined by the function wrapped
+// in ClockFunc.
+func (cf ClockFunc) Now() time.Time {
+	return cf()
+}
+
 // GCRARateLimiter is a RateLimiter that users the generic cell-rate
 // algorithm. The algorithm has been slightly modified from its usual
 // form to support limiting with an additional quantity parameter, such
 // as for limiting the number of bytes uploaded.
 type GCRARateLimiter struct {
+	Clock Clock
+
 	limit int
 
 	// Think of the DVT as our flexibility:
@@ -152,6 +169,7 @@ func NewGCRARateLimiter(maxKeys int, quota RateQuota) (*GCRARateLimiter, error) 
 	}
 
 	return &GCRARateLimiter{
+		Clock:                   ClockFunc(time.Now),
 		delayVariationTolerance: quota.MaxRate.period * (time.Duration(quota.MaxBurst) + 1),
 		emissionInterval:        quota.MaxRate.period,
 		limit:                   quota.MaxBurst + 1,
@@ -183,7 +201,7 @@ func (g *GCRARateLimiter) RateLimit(key string, quantity int) (bool, RateLimitRe
 	// from equally spaced requests at exactly the rate limit.
 
 	// START g.store.GetWithTime
-	now = time.Now()
+	now = g.Clock.Now()
 	storeVal, ok := g.keys.Get(key)
 	if !ok {
 		tatVal = -1

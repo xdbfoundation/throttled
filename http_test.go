@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/throttled/throttled"
+	"github.com/bartekn/throttled"
 )
 
 type stubLimiter struct {

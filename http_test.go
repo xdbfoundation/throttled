@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stellar/throttled"
+	"github.com/xdbfoundation/throttled"
 )
 
 type stubLimiter struct {
